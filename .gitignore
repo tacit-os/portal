@@ -1,0 +1,7 @@
+build/
+keyring-prompter/tacit-keyring-prompter
+share-plugin/tacit-share.so
+share-plugin/.hyprver
+tests/share-live/share-watch
+tests/share-live/hyprland-toplevel-export-v1-client.h
+tests/share-live/hyprland-toplevel-export-v1-protocol.c

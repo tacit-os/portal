@@ -1,0 +1,27 @@
+#!/bin/bash
+# Stand-in for qs in tests/run-in-jail.sh. Starting the relay (`qs -p FILE`) and calling it (`qs -p FILE ipc call`)
+# run the real qs. `qs -c CONFIG ipc call files pick|pickdir FOLDER RELAY TARGET LABEL` is Files: it logs the
+# call (also `save FOLDER NAME RELAY TARGET LABEL` and `savefolder FOLDER RELAY TARGET LABEL`), then does what Files.pickDone does for the scenario in $TP_SCENARIO (first line: MODE [JSON]).
+echo "$(date +%T.%N) qs $*" >>"$TP_OUT/qs-calls.log"
+[ "$1" = -c ] || exec /usr/bin/qs "$@"
+shift 2   # -c CONFIG
+[ "$1 $2 $3" = "ipc call files" ] || exit 1
+verb=$4 folder=$5 relay=$6 target=$7
+[ "$verb" = save ] && { name=$6 relay=$7 target=$8; }
+read -r mode json <"$TP_SCENARIO"
+case $mode in
+noshell) echo "No running instances for config $1" >&2; exit 1 ;;
+hold) sleep 60; exit 0 ;;
+choose) ;;
+choosefolder) json="[\"$folder\"]" ;;
+savename) json="[\"$folder/$name\"]" ;;   # Save with the name as suggested
+savekeep) json="[\"$folder/${name%.*} 2.${name##*.}\"]" ;;   # the name was taken; Keep both   # folder mode, nothing selected: the folder the window shows
+cancel) json='[]' ;;
+esac
+json=" $json "   # padded as Files pads it (services/Files.qml pickDone)
+sleep 1
+for _ in $(seq 50); do   # the relay may still be starting; a person takes longer than this
+	/usr/bin/qs -p "$relay" ipc call "$target" picked "$json" >/dev/null 2>&1 && exit 0
+	sleep 0.2
+done
+exit 1

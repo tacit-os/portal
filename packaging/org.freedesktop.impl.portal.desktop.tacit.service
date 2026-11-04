@@ -1,0 +1,3 @@
+[D-BUS Service]
+Name=org.freedesktop.impl.portal.desktop.tacit
+Exec=/usr/lib/tacit-portal/tacit-portal

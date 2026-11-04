@@ -1,0 +1,178 @@
+#!/usr/bin/env python3
+"""xdg-desktop-portal-hyprland custom_picker_binary: asks the shell (via tacit-portal's DialogBridge) which screen,
+window or region to share, and prints the selection line xdph reads:
+    [SELECTION]<flags>/screen:<NAME> | /window:<id> | /region:<output>@x,y,w,h      (flag r = remember: restore token)
+Input: env XDPH_WINDOW_SHARING_LIST = repeated "<id>[HC>]<class>[HT>]<title>[HE>]<field4>[HA>]", arg --allow-token.
+No shell or no portal: hands over to the stock hyprland-share-picker, so sharing never stops working. Nothing is
+printed on cancel (xdph then cancels the cast). Protocol: ~/dev/tacit-portal/DIALOGS.md.
+"""
+import json, os, signal, socket, subprocess, sys
+
+SOCK = os.environ.get("TACIT_DIALOGS_SOCK") or os.path.join(os.environ.get("XDG_RUNTIME_DIR", "/run/user/%d" % os.getuid()), "tacit-dialogs.sock")
+STOCK = os.environ.get("TACIT_STOCK_PICKER", "/usr/bin/hyprland-share-picker")
+
+
+def hypr(*a):
+    try:
+        return json.loads(subprocess.run(["hyprctl", "-j", *a], capture_output=True, text=True, timeout=3).stdout)
+    except Exception:
+        return None
+
+
+def parse_list(s):
+    out = []
+    for ent in s.split("[HA>]"):
+        if not ent.strip():
+            continue
+        try:
+            wid, rest = ent.split("[HC>]", 1)
+            cls, rest = rest.split("[HT>]", 1)
+            title, f4 = rest.split("[HE>]", 1)
+        except ValueError:
+            continue
+        out.append({"id": wid.strip(), "class": cls, "title": title, "f4": f4.strip()})
+    return out
+
+
+def build_params(allow_token):
+    wins = parse_list(os.environ.get("XDPH_WINDOW_SHARING_LIST", ""))
+    clients = hypr("clients") or []
+    mons = hypr("monitors") or []
+    active = hypr("activewindow") or {}
+    by_addr = {int(c["address"], 16): c for c in clients if c.get("address")}
+    for w in wins:
+        # field 4 is the window address on current xdph (decimal); otherwise fall back to class + title
+        c = None
+        try:
+            c = by_addr.get(int(w["f4"]))
+        except ValueError:
+            pass
+        if c is None:
+            c = next((c for c in clients if c.get("class") == w["class"] and c.get("title") == w["title"]), None)
+        w["address"] = c["address"] if c else ""
+        del w["f4"]
+    asker = None
+    mon_name = next((m["name"] for m in mons if m.get("focused")), mons[0]["name"] if mons else "")
+    if active.get("address"):
+        asker = {"x": active["at"][0], "y": active["at"][1], "w": active["size"][0], "h": active["size"][1]}
+        cls = active.get("class", "")
+        m = next((m for m in mons if m["id"] == active.get("monitor")), None)
+        if m:
+            mon_name = m["name"]
+    else:
+        cls = ""
+    m = next((m for m in mons if m["name"] == mon_name), None)
+    # monitor sizes in layout (scaled) pixels, which is what the region is measured in
+    def lsize(m):
+        t = m.get("transform", 0) % 2
+        w, h = (m["height"], m["width"]) if t else (m["width"], m["height"])
+        sc = m.get("scale", 1) or 1
+        return round(w / sc), round(h / sc)
+    screen = None
+    if m:
+        w, h = lsize(m)
+        screen = {"name": m["name"], "x": m["x"], "y": m["y"], "w": w, "h": h}
+    return {
+        "app": "",  # the shell resolves the display name from the class
+        "appClass": cls,
+        "monitor": mon_name,
+        "screen": screen,
+        "screens": [{"name": m["name"], "w": lsize(m)[0], "h": lsize(m)[1]} for m in mons],
+        "windows": wins,
+        "asker": asker,
+        "allowToken": allow_token,
+    }
+
+
+def stock():
+    os.execv(STOCK, [STOCK] + sys.argv[1:])
+
+
+def connect():
+    s = socket.socket(socket.AF_UNIX)
+    s.settimeout(5)
+    s.connect(SOCK)
+    return s
+
+
+def link():
+    try:
+        return connect()
+    except OSError:
+        pass
+    # not running: start the portal over D-Bus, once
+    try:
+        subprocess.run(["busctl", "--user", "call", "org.freedesktop.DBus", "/org/freedesktop/DBus", "org.freedesktop.DBus",
+                        "StartServiceByName", "su", "org.freedesktop.impl.portal.desktop.tacit", "0"],
+                       capture_output=True, timeout=10)
+        return connect()
+    except Exception:
+        return None
+
+
+def selection_line(r):
+    flags = "r" if r.get("token") else ""
+    k = r.get("kind")
+    if k == "screen":
+        return f"[SELECTION]{flags}/screen:{r['name']}"
+    if k == "window":
+        return f"[SELECTION]{flags}/window:{r['id']}"
+    if k == "region":
+        return f"[SELECTION]{flags}/region:{r['output']}@{int(r['x'])},{int(r['y'])},{int(r['w'])},{int(r['h'])}"
+    return None
+
+
+def main():
+    allow = "--allow-token" in sys.argv[1:]
+    s = link()
+    if s is None:
+        stock()
+    def send(o):
+        s.sendall(json.dumps(o).encode() + b"\n")
+    buf = b""
+    def line():
+        nonlocal buf
+        while b"\n" not in buf:
+            d = s.recv(65536)
+            if not d:
+                return None
+            buf += d
+        l, buf = buf.split(b"\n", 1)
+        return json.loads(l)
+    try:
+        send({"op": "hello", "role": "client", "proto": 1})
+        h = line()
+        if not h or not h.get("ui"):
+            stock()
+        send({"op": "ask", "id": "p1", "kind": "share.pick", "params": build_params(allow)})
+        # xdph kills the picker when the cast is cancelled elsewhere: withdraw the sheet
+        def bye(*_):
+            try:
+                send({"op": "cancel", "id": "p1"})
+            except OSError:
+                pass
+            os._exit(1)
+        signal.signal(signal.SIGTERM, bye)
+        signal.signal(signal.SIGINT, bye)
+        s.settimeout(None)
+        while True:
+            m = line()
+            if m is None:
+                return 1
+            if m.get("op") == "reject":
+                # no shell before the sheet ever showed: stock picker; a user's cancel or refusal: print nothing
+                if m.get("reason") in ("no-shell", "shell-gone", "unsupported"):
+                    stock()
+                return 1
+            if m.get("op") == "answer":
+                out = selection_line(m.get("result") or {})
+                if not out:
+                    return 1
+                print(out, flush=True)
+                return 0
+    except (OSError, ValueError):
+        stock()
+
+
+if __name__ == "__main__":
+    sys.exit(main())
